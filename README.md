@@ -120,6 +120,20 @@ scheduler automatically.
 The contract intentionally records only required environment-variable names in
 `required_env`; never put secret values in `apux.yaml`.
 
+Use a secret reference when the runtime name differs from its source:
+
+```yaml
+required_env:
+  - name: API_TOKEN
+    source: env://LOCAL_API_TOKEN
+  - name: DEPLOY_TOKEN
+    source: op://production/deploy/token
+```
+
+`env://` reads a local environment variable only during execution. `op://`
+uses the 1Password CLI only during execution. Apux never stores or displays a
+resolved value; evidence records only source availability.
+
 ## Development
 
 ```sh
