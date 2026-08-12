@@ -88,6 +88,11 @@ scheduler, install a service, or inject undeclared secrets.
 - Docker image, container filesystem, working-directory, and environment drift
 - GitHub Actions job container, declared environment names, and runnable steps
 
+Apux uses shell-aware lexical analysis for common scripts: it ignores comments
+and single-quoted literals and does not report variables assigned inside the
+script as missing inherited environment. It does not evaluate `source`, command
+substitutions, or arbitrary shell code.
+
 GitHub Actions replay currently supports jobs with an explicit `container:`. It
 mounts the checkout at `/github/workspace`, runs each `run:` step with
 `/bin/sh -e -c`, and intentionally skips `uses:` actions; this makes the local

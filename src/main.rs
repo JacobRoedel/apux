@@ -309,6 +309,71 @@ fn file_contents(command: &[OsString]) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// Removes comments and single-quoted literals while preserving executable shell syntax.
+/// This is deliberately a small lexer, not a shell interpreter: it makes diagnostics
+/// less noisy without claiming to evaluate expansions or source external files.
+fn executable_shell_code(content: &str) -> String {
+    let mut output = String::new();
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut escaped = false;
+    for line in content.lines() {
+        for character in line.chars() {
+            if escaped {
+                output.push(character);
+                escaped = false;
+                continue;
+            }
+            if character == '\\' && !single_quote {
+                output.push(character);
+                escaped = true;
+                continue;
+            }
+            if character == '\'' && !double_quote {
+                single_quote = !single_quote;
+                output.push(' ');
+                continue;
+            }
+            if character == '"' && !single_quote {
+                double_quote = !double_quote;
+                output.push(character);
+                continue;
+            }
+            if character == '#' && !single_quote && !double_quote {
+                break;
+            }
+            output.push(if single_quote { ' ' } else { character });
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn shell_assignments(code: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in code.lines() {
+        let line = line
+            .trim_start()
+            .strip_prefix("export ")
+            .unwrap_or(line.trim_start());
+        let Some((name, _)) = line.split_once('=') else {
+            continue;
+        };
+        if !name.is_empty()
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            names.insert(name.into());
+        }
+    }
+    names
+}
+
 fn referenced_env(content: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let bytes = content.as_bytes();
@@ -347,6 +412,15 @@ fn referenced_env(content: &str) -> BTreeSet<String> {
         }
     }
     names
+}
+
+fn external_env_references(content: &str) -> BTreeSet<String> {
+    let code = executable_shell_code(content);
+    let assignments = shell_assignments(&code);
+    referenced_env(&code)
+        .difference(&assignments)
+        .cloned()
+        .collect()
 }
 
 fn is_cron_path_executable(name: &str) -> bool {
@@ -429,7 +503,8 @@ fn findings(command: &[OsString]) -> Vec<Finding> {
             ));
         }
         let ignored = ["PATH", "HOME", "PWD", "SHELL", "USER", "?", "#", "$", "0"];
-        let refs: Vec<_> = referenced_env(&content)
+        let code = executable_shell_code(&content);
+        let refs: Vec<_> = external_env_references(&content)
             .into_iter()
             .filter(|n| !ignored.contains(&n.as_str()))
             .collect();
@@ -443,7 +518,7 @@ fn findings(command: &[OsString]) -> Vec<Finding> {
                 "declare required variables in a wrapper or scheduler configuration",
             ));
         }
-        if content.contains("./") || content.contains("../") {
+        if code.contains("./") || code.contains("../") {
             out.push(Finding::warning(
                 "APX009",
                 "script uses relative paths",
@@ -542,7 +617,7 @@ fn systemd_findings(command: &[OsString]) -> Vec<Finding> {
         ));
     }
     if let Some(content) = file_contents(command) {
-        let refs: Vec<_> = referenced_env(&content)
+        let refs: Vec<_> = external_env_references(&content)
             .into_iter()
             .filter(|n| !["PATH", "HOME", "PWD", "SHELL", "USER"].contains(&n.as_str()))
             .collect();
@@ -607,7 +682,7 @@ fn launchd_findings(command: &[OsString]) -> Vec<Finding> {
         ));
     }
     if let Some(content) = file_contents(command) {
-        let refs: Vec<_> = referenced_env(&content)
+        let refs: Vec<_> = external_env_references(&content)
             .into_iter()
             .filter(|n| !["PATH", "HOME", "PWD", "SHELL", "USER"].contains(&n.as_str()))
             .collect();
@@ -1145,7 +1220,7 @@ fn diff(command: &[OsString]) {
         }
     }
     if let Some(content) = file_contents(command) {
-        let refs: Vec<_> = referenced_env(&content)
+        let refs: Vec<_> = external_env_references(&content)
             .into_iter()
             .filter(|name| !["PATH", "HOME", "PWD", "SHELL", "USER"].contains(&name.as_str()))
             .collect();
@@ -1503,6 +1578,14 @@ mod tests {
         assert_eq!(
             referenced_env("$TOKEN ${DATABASE_URL} $$ $1"),
             BTreeSet::from(["DATABASE_URL".into(), "TOKEN".into()])
+        );
+    }
+    #[test]
+    fn ignores_comments_literals_and_local_assignments() {
+        let script = "# $COMMENT\nTOKEN=generated\necho '$LITERAL' \"$EXTERNAL\" $TOKEN\nexport LOCAL=value\necho $LOCAL\n";
+        assert_eq!(
+            external_env_references(script),
+            BTreeSet::from(["EXTERNAL".into()])
         );
     }
     #[test]
