@@ -39,6 +39,10 @@ apux verify --target cron
 # Execute the declared command in its declared target context.
 apux run --contract apux.yaml
 
+# Capture a successful (or failed) run's non-secret context, then detect drift.
+apux record --contract apux.yaml
+apux diff --last-run --contract apux.yaml
+
 # Open a real shell with cron's isolated environment.
 apux debug --target cron -- ./scripts/nightly-sync.sh
 
@@ -70,6 +74,11 @@ with an empty environment and adds only cron's normal shell, PATH, and HOME.
 contracts with only their declared PATH and required environment names, and
 Docker contracts in their declared image. Values are read only at runtime and
 never written to the contract or diagnostic output.
+
+`record` writes `.apux/last-run.yaml` with non-secret runtime evidence: target,
+command, working directory, declared PATH/shell/image, host, user, required
+environment availability, and exit code. `diff --last-run` compares that baseline
+to the current contract and environment without reading environment values.
 
 `debug` opens a shell in the cron or Docker context. It does not modify a
 scheduler, install a service, or inject undeclared secrets.
