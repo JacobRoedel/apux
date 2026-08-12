@@ -1231,47 +1231,117 @@ fn verify_contract(path: &Path, target: &str) -> bool {
     has_errors
 }
 
-fn init(command: &[OsString]) -> io::Result<()> {
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn init(target: &str, command: &[OsString], image: Option<&str>) -> io::Result<()> {
     let root = env::current_dir()?;
     let apux_dir = root.join(".apux");
     fs::create_dir_all(&apux_dir)?;
-    let log_path = root.join(".apux/cron.log");
-    let wrapper = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\n\ncd {}\nexport PATH=\"{}\"\nexport HOME=\"${{HOME:-/}}\"\n\nexec {} >> {} 2>&1\n",
-        shell_quote(&root.display().to_string()),
-        CRON_PATH,
-        command_display(command),
-        shell_quote(&log_path.display().to_string())
-    );
-    let wrapper_path = apux_dir.join("run.sh");
-    fs::write(&wrapper_path, wrapper)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
-    }
+    let log_path = root.join(format!(".apux/{target}.log"));
     let contract = ExecutionContract {
         version: 1,
-        target: "cron".into(),
+        target: target.into(),
         command: command
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect(),
         working_directory: root.clone(),
-        shell: Some("/usr/bin/env bash".into()),
-        path: Some(CRON_PATH.into()),
+        shell: (target == "cron").then(|| "/usr/bin/env bash".into()),
+        path: (target == "cron").then(|| CRON_PATH.into()),
         required_env: vec![],
         log: Some(log_path),
-        image: None,
+        image: image.map(str::to_owned),
     };
     fs::write(
         root.join("apux.yaml"),
         serde_yaml::to_string(&contract).map_err(io::Error::other)?,
     )?;
-    println!(
-        "Created .apux/run.sh and apux.yaml.\n\nReview them, then add a schedule like:\n  0 2 * * * {}\n",
-        wrapper_path.display()
-    );
+    match target {
+        "cron" => {
+            let wrapper_path = apux_dir.join("run.sh");
+            fs::write(
+                &wrapper_path,
+                format!(
+                    "#!/usr/bin/env bash\nset -euo pipefail\n\nexec apux run --contract {}\n",
+                    shell_quote(&root.join("apux.yaml").display().to_string())
+                ),
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
+            }
+            println!(
+                "Created .apux/run.sh and apux.yaml.\n\nReview them, then add a schedule like:\n  0 2 * * * {}\n",
+                wrapper_path.display()
+            );
+        }
+        "systemd" => {
+            let path = apux_dir.join("apux.service");
+            fs::write(
+                &path,
+                format!(
+                    "[Unit]\nDescription=Apux managed job\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nExecStart=apux run --contract {}\n",
+                    root.display(),
+                    root.join("apux.yaml").display()
+                ),
+            )?;
+            println!(
+                "Created {} and apux.yaml.\n\nReview it, then copy it to ~/.config/systemd/user/ or /etc/systemd/system/ and enable it yourself.",
+                path.display()
+            );
+        }
+        "launchd" => {
+            let path = apux_dir.join("com.apux.job.plist");
+            fs::write(
+                &path,
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.apux.job</string>\n  <key>ProgramArguments</key><array><string>apux</string><string>run</string><string>--contract</string><string>{}</string></array>\n  <key>WorkingDirectory</key><string>{}</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+                    xml_escape(&root.join("apux.yaml").display().to_string()),
+                    xml_escape(&root.display().to_string()),
+                    xml_escape(&log_path.display().to_string()),
+                    xml_escape(&log_path.display().to_string())
+                ),
+            )?;
+            println!(
+                "Created {} and apux.yaml.\n\nReview it, then load it with launchctl yourself.",
+                path.display()
+            );
+        }
+        "docker" => {
+            let image = image.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Docker init requires --image <image>",
+                )
+            })?;
+            let path = apux_dir.join("compose.apux.yaml");
+            fs::write(
+                &path,
+                format!(
+                    "services:\n  apux-job:\n    image: {}\n    working_dir: /workspace\n    volumes:\n      - .:/workspace\n    command: {}\n",
+                    serde_yaml::to_string(image)
+                        .map_err(io::Error::other)?
+                        .trim(),
+                    serde_yaml::to_string(&contract.command)
+                        .map_err(io::Error::other)?
+                        .trim()
+                ),
+            )?;
+            println!(
+                "Created {} and apux.yaml.\n\nReview it, then run `docker compose -f {} run --rm apux-job` yourself.",
+                path.display(),
+                path.display()
+            );
+        }
+        _ => unreachable!(),
+    }
     Ok(())
 }
 
@@ -1378,20 +1448,17 @@ fn main() -> ExitCode {
             );
             ExitCode::from(2)
         }
-        "init" if invocation.target == "cron" => match init(&invocation.command) {
+        "init" => match init(
+            &invocation.target,
+            &invocation.command,
+            invocation.image.as_deref(),
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: could not create Apux files: {error}");
                 ExitCode::from(1)
             }
         },
-        "init" => {
-            eprintln!(
-                "error: `init` currently generates cron wrappers only; use check and verify for {} today",
-                invocation.target
-            );
-            ExitCode::from(2)
-        }
         "verify" => {
             if verify_contract(&invocation.contract, &invocation.target) {
                 ExitCode::from(1)
