@@ -3,7 +3,8 @@ use std::{
     collections::BTreeSet,
     env,
     ffi::OsString,
-    fs, io,
+    fs::{self, OpenOptions},
+    io,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
@@ -86,7 +87,7 @@ struct ExecutionContract {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target docker --image node:22 -- npm test\n  apux inspect github-actions --file .github/workflows/ci.yml --job test\n  apux verify --target cron"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux run --contract apux.yaml\n  apux check --target docker --image node:22 -- npm test\n  apux inspect github-actions --file .github/workflows/ci.yml --job test"
     );
 }
 
@@ -141,7 +142,26 @@ fn parse_args() -> Result<Invocation, String> {
             job,
         });
     }
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--target")) {
+    let first_flag = args.next();
+    if action == "run" && first_flag.as_deref() == Some(std::ffi::OsStr::new("--contract")) {
+        let contract = match args.next() {
+            None => PathBuf::from("apux.yaml"),
+            Some(path) => PathBuf::from(path),
+        };
+        if args.next().is_some() {
+            return Err("run --contract accepts one optional contract path".into());
+        }
+        return Ok(Invocation {
+            action,
+            target: "contract".into(),
+            command: vec![],
+            contract,
+            image: None,
+            workflow: None,
+            job: None,
+        });
+    }
+    if first_flag.as_deref() != Some(std::ffi::OsStr::new("--target")) {
         return Err("expected --target cron".into());
     }
     let target = args
@@ -756,6 +776,144 @@ fn run_docker(command: &[OsString], image: &str) -> io::Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn required_environment(contract: &ExecutionContract) -> Result<Vec<(String, OsString)>, String> {
+    contract.required_env.iter().map(|name| {
+        env::var_os(name).map(|value| (name.clone(), value)).ok_or_else(|| format!("required environment variable `{name}` is not set in the invoking environment"))
+    }).collect()
+}
+
+fn shell_parts(shell: &str) -> Result<Vec<&str>, String> {
+    let parts: Vec<_> = shell.split_whitespace().collect();
+    if parts.is_empty() {
+        Err("contract shell is empty".into())
+    } else {
+        Ok(parts)
+    }
+}
+
+fn run_contract_cron(contract: &ExecutionContract) -> Result<i32, String> {
+    let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
+    let required_environment = required_environment(contract)?;
+    let mut process = if let Some(shell) = &contract.shell {
+        let parts = shell_parts(shell)?;
+        let mut process = Command::new(parts[0]);
+        process
+            .args(&parts[1..])
+            .arg("-c")
+            .arg(command_display(&command));
+        process
+    } else {
+        let mut process = Command::new(&command[0]);
+        process.args(&command[1..]);
+        process
+    };
+    process
+        .env_clear()
+        .env("PATH", contract.path.as_deref().unwrap_or(CRON_PATH))
+        .env("SHELL", contract.shell.as_deref().unwrap_or(CRON_SHELL))
+        .env(
+            "HOME",
+            env::var_os("HOME").unwrap_or_else(|| OsString::from("/")),
+        )
+        .env(
+            "LOGNAME",
+            env::var("USER").unwrap_or_else(|_| "unknown".into()),
+        )
+        .current_dir(&contract.working_directory);
+    for (name, value) in required_environment {
+        process.env(name, value);
+    }
+    if let Some(log) = &contract.log {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(|error| format!("cannot open log {}: {error}", log.display()))?;
+        process
+            .stdout(file.try_clone().map_err(|error| error.to_string())?)
+            .stderr(file);
+    }
+    process
+        .status()
+        .map(|status| status.code().unwrap_or(1))
+        .map_err(|error| format!("failed to start contract command: {error}"))
+}
+
+fn run_contract_docker(contract: &ExecutionContract) -> Result<i32, String> {
+    let image = contract
+        .image
+        .as_deref()
+        .ok_or("Docker contract requires `image`")?;
+    let required_environment = required_environment(contract)?;
+    let mut process = Command::new("docker");
+    process
+        .args([
+            "run",
+            "--rm",
+            "--init",
+            "--workdir",
+            "/workspace",
+            "--volume",
+        ])
+        .arg(format!(
+            "{}:/workspace",
+            contract.working_directory.display()
+        ));
+    for (name, _) in &required_environment {
+        process.arg("--env").arg(name);
+    }
+    if let Some(path) = &contract.path {
+        process.arg("--env").arg(format!("PATH={path}"));
+    }
+    process.arg(image);
+    if let Some(shell) = &contract.shell {
+        let parts = shell_parts(shell)?;
+        let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
+        process.args(parts).arg("-c").arg(command_display(&command));
+    } else {
+        process.args(&contract.command);
+    }
+    if let Some(log) = &contract.log {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(|error| format!("cannot open log {}: {error}", log.display()))?;
+        process
+            .stdout(file.try_clone().map_err(|error| error.to_string())?)
+            .stderr(file);
+    }
+    process
+        .status()
+        .map(|status| status.code().unwrap_or(1))
+        .map_err(|error| format!("failed to start Docker: {error}"))
+}
+
+fn run_contract(path: &Path) -> Result<i32, String> {
+    let contract = read_contract(path)?;
+    if contract.version != 1 {
+        return Err(format!("unsupported contract version {}", contract.version));
+    }
+    if contract.command.is_empty() {
+        return Err("contract command is empty".into());
+    }
+    if !contract.working_directory.is_dir() {
+        return Err(format!(
+            "working directory `{}` does not exist",
+            contract.working_directory.display()
+        ));
+    }
+    match contract.target.as_str() {
+        "cron" => run_contract_cron(&contract),
+        "docker" => run_contract_docker(&contract),
+        "systemd" | "launchd" => Err(format!(
+            "running a `{}` contract requires its service manager; use `apux verify --target {}` to preflight it",
+            contract.target, contract.target
+        )),
+        target => Err(format!("unsupported contract target `{target}`")),
+    }
+}
+
 fn diff(command: &[OsString]) {
     println!(
         "Apux context diff: local → cron\n  command: {}\n",
@@ -947,6 +1105,14 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "run" if invocation.target == "contract" => match run_contract(&invocation.contract) {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(code) => ExitCode::from(code as u8),
+            Err(error) => {
+                eprintln!("error: contract run failed: {error}");
+                ExitCode::from(1)
+            }
+        },
         "run" if invocation.target == "docker" => match invocation.image.as_deref() {
             Some(image) => match run_docker(&invocation.command, image) {
                 Ok(0) => ExitCode::SUCCESS,
@@ -1037,5 +1203,21 @@ mod tests {
         fs::write(&root, "env:\n  TOKEN: ${{ secrets.TOKEN }}\njobs:\n  test:\n    container: node:22\n    env:\n      NODE_ENV: test\n    steps:\n      - uses: actions/checkout@v4\n      - name: Test\n        run: npm test\n").unwrap();
         assert!(inspect_github_actions(&root, Some("test")).is_ok());
         fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn runs_a_minimal_cron_contract() {
+        let contract = ExecutionContract {
+            version: 1,
+            target: "cron".into(),
+            command: vec!["/usr/bin/true".into()],
+            working_directory: PathBuf::from("/tmp"),
+            shell: None,
+            path: None,
+            required_env: vec![],
+            log: None,
+            image: None,
+        };
+        assert_eq!(run_contract_cron(&contract).unwrap(), 0);
     }
 }

@@ -31,6 +31,9 @@ apux init --target cron -- ./scripts/nightly-sync.sh
 # environment *names* in apux.yaml.
 apux verify --target cron
 
+# Execute the declared command in its declared target context.
+apux run --contract apux.yaml
+
 # systemd has different rules: no implicit shell and an absolute ExecStart path.
 apux check --target systemd -- /usr/local/bin/nightly-sync
 
@@ -49,6 +52,11 @@ apux inspect github-actions --file .github/workflows/ci.yml --job test
 claims that every job will fail. `run` is the proof step; it starts the command
 with an empty environment and adds only cron's normal shell, PATH, and HOME.
 `verify` makes that context review repeatable in CI or pre-commit hooks.
+
+`run --contract` makes `apux.yaml` the source of truth. It executes cron
+contracts with only their declared PATH and required environment names, and
+Docker contracts in their declared image. Values are read only at runtime and
+never written to the contract or diagnostic output.
 
 ## What it checks today
 
