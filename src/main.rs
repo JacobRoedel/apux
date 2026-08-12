@@ -79,11 +79,32 @@ struct ExecutionContract {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
-    required_env: Vec<String>,
+    required_env: Vec<RequiredEnvironment>,
     #[serde(default)]
     log: Option<PathBuf>,
     #[serde(default)]
     image: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum RequiredEnvironment {
+    Name(String),
+    Reference { name: String, source: String },
+}
+
+impl RequiredEnvironment {
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Reference { name, .. } => name,
+        }
+    }
+    fn source(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::Reference { source, .. } => Some(source),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1121,9 +1142,80 @@ fn debug_docker(image: &str) -> io::Result<i32> {
 }
 
 fn required_environment(contract: &ExecutionContract) -> Result<Vec<(String, OsString)>, String> {
-    contract.required_env.iter().map(|name| {
-        env::var_os(name).map(|value| (name.clone(), value)).ok_or_else(|| format!("required environment variable `{name}` is not set in the invoking environment"))
-    }).collect()
+    contract
+        .required_env
+        .iter()
+        .map(resolve_required_environment)
+        .collect()
+}
+
+fn resolve_required_environment(
+    requirement: &RequiredEnvironment,
+) -> Result<(String, OsString), String> {
+    let name = requirement.name();
+    let value = match requirement.source() {
+        None => env::var_os(name).ok_or_else(|| {
+            format!("required environment variable `{name}` is not set in the invoking environment")
+        })?,
+        Some(source) if source.starts_with("env://") => {
+            let source_name = source.trim_start_matches("env://");
+            env::var_os(source_name).ok_or_else(|| {
+                format!("secret source `{source}` is not set in the invoking environment")
+            })?
+        }
+        Some(source) if source.starts_with("op://") => {
+            let output = Command::new("op")
+                .args(["read", source])
+                .output()
+                .map_err(|error| {
+                    format!("cannot resolve `{source}` with 1Password CLI: {error}")
+                })?;
+            if !output.status.success() {
+                return Err(format!(
+                    "1Password could not resolve secret source `{source}`"
+                ));
+            }
+            let mut value = output.stdout;
+            while value
+                .last()
+                .is_some_and(|byte| byte == &b'\n' || byte == &b'\r')
+            {
+                value.pop();
+            }
+            OsString::from(
+                String::from_utf8(value)
+                    .map_err(|_| format!("secret source `{source}` is not valid UTF-8"))?,
+            )
+        }
+        Some(source) => {
+            return Err(format!(
+                "unsupported secret source `{source}`; supported sources: env://NAME, op://vault/item/field"
+            ));
+        }
+    };
+    Ok((name.into(), value))
+}
+
+fn required_environment_available(requirement: &RequiredEnvironment) -> bool {
+    match requirement.source() {
+        None => env::var_os(requirement.name()).is_some(),
+        Some(source) if source.starts_with("env://") => {
+            env::var_os(source.trim_start_matches("env://")).is_some()
+        }
+        Some(source) if source.starts_with("op://") => Command::new("op")
+            .arg("whoami")
+            .output()
+            .is_ok_and(|output| output.status.success()),
+        Some(_) => false,
+    }
+}
+
+fn required_environment_names(contract: &ExecutionContract) -> Vec<String> {
+    contract
+        .required_env
+        .iter()
+        .map(|value| value.name().into())
+        .collect()
 }
 
 fn shell_parts(shell: &str) -> Result<Vec<&str>, String> {
@@ -1283,7 +1375,7 @@ fn capture_evidence(contract: &ExecutionContract, exit_code: i32) -> RuntimeEvid
         required_env_present: contract
             .required_env
             .iter()
-            .map(|name| (name.clone(), env::var_os(name).is_some()))
+            .map(|value| (value.name().into(), required_environment_available(value)))
             .collect(),
         exit_code,
     }
@@ -1470,7 +1562,7 @@ fn verify_contract(path: &Path, target: &str) -> bool {
     if !contract.required_env.is_empty() {
         println!(
             "INFO APX026: required environment names are declared: {}",
-            contract.required_env.join(", ")
+            required_environment_names(&contract).join(", ")
         );
         println!(
             "  ensure your scheduler injects these values; Apux never reads or stores their values."
@@ -1793,7 +1885,17 @@ mod tests {
         let value = "version: 1\ntarget: cron\ncommand:\n  - /bin/echo\n  - hello\nworking_directory: /tmp\nrequired_env:\n  - API_TOKEN\n";
         let contract: ExecutionContract = serde_yaml::from_str(value).unwrap();
         assert_eq!(contract.command, ["/bin/echo", "hello"]);
-        assert_eq!(contract.required_env, ["API_TOKEN"]);
+        assert_eq!(required_environment_names(&contract), ["API_TOKEN"]);
+    }
+
+    #[test]
+    fn supports_secret_references_without_serializing_values() {
+        let contract: ExecutionContract = serde_yaml::from_str("version: 1\ntarget: cron\ncommand: [/usr/bin/true]\nworking_directory: /tmp\nrequired_env:\n  - name: API_TOKEN\n    source: env://LOCAL_API_TOKEN\n").unwrap();
+        assert_eq!(contract.required_env[0].name(), "API_TOKEN");
+        assert_eq!(
+            contract.required_env[0].source(),
+            Some("env://LOCAL_API_TOKEN")
+        );
     }
 
     #[test]
