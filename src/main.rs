@@ -11,6 +11,7 @@ use std::{
 const CRON_PATH: &str = "/usr/bin:/bin";
 const CRON_SHELL: &str = "/bin/sh";
 const SYSTEMD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -80,7 +81,7 @@ struct ExecutionContract {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd> -- <command> [args...]\n  apux verify --target <cron|systemd> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target systemd -- /usr/local/bin/nightly-sync\n  apux verify --target cron"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target systemd -- /usr/local/bin/nightly-sync\n  apux check --target launchd -- /usr/local/bin/nightly-sync\n  apux verify --target cron"
     );
 }
 
@@ -108,9 +109,9 @@ fn parse_args() -> Result<Invocation, String> {
         .ok_or("missing target after --target")?
         .to_string_lossy()
         .to_string();
-    if !matches!(target.as_str(), "cron" | "systemd") {
+    if !matches!(target.as_str(), "cron" | "systemd" | "launchd") {
         return Err(format!(
-            "unsupported target: {target}. Supported targets: cron, systemd."
+            "unsupported target: {target}. Supported targets: cron, systemd, launchd."
         ));
     }
     if action == "verify" {
@@ -444,10 +445,86 @@ fn print_systemd_findings(command: &[OsString]) -> bool {
     results.iter().any(|f| f.level == Level::Error)
 }
 
+fn launchd_findings(command: &[OsString]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let program = command_path(command);
+    let program_s = program.to_string_lossy();
+    if !program.is_absolute() {
+        out.push(Finding::error("APX040", format!("launchd ProgramArguments[0] should be an absolute executable path; `{program_s}` is relative"), "use an absolute executable path in the launchd plist"));
+    } else if !program.is_file() {
+        out.push(Finding::error(
+            "APX001",
+            format!("command path `{program_s}` does not exist"),
+            "check the path on the Mac that runs launchd",
+        ));
+    }
+    if command.iter().skip(1).any(|arg| {
+        matches!(
+            arg.to_string_lossy().as_ref(),
+            "|" | "&&" | "||" | ";" | ">" | ">>"
+        )
+    }) {
+        out.push(Finding::warning(
+            "APX041",
+            "launchd does not run ProgramArguments through a shell",
+            "put shell control operators in a wrapper script and invoke that script",
+        ));
+    }
+    if let Some(content) = file_contents(command) {
+        let refs: Vec<_> = referenced_env(&content)
+            .into_iter()
+            .filter(|n| !["PATH", "HOME", "PWD", "SHELL", "USER"].contains(&n.as_str()))
+            .collect();
+        if !refs.is_empty() {
+            out.push(Finding::warning(
+                "APX005",
+                format!(
+                    "script references environment variables launchd will not inherit: {}",
+                    refs.join(", ")
+                ),
+                "declare EnvironmentVariables in the launchd plist or load values in a wrapper",
+            ));
+        }
+        if content.contains("./") || content.contains("../") {
+            out.push(Finding::warning(
+                "APX009",
+                "script uses relative paths",
+                "set WorkingDirectory in the plist or cd in a wrapper",
+            ));
+        }
+    }
+    out.push(Finding::info(
+        "APX042",
+        "declare StandardOutPath and StandardErrorPath in the plist for durable logs",
+    ));
+    out
+}
+
+fn print_launchd_findings(command: &[OsString]) -> bool {
+    println!(
+        "Apux preflight: launchd\n  command: {}\n  shell:   none (ProgramArguments runs directly)\n  PATH:    {LAUNCHD_PATH}\n",
+        command_display(command)
+    );
+    let results = launchd_findings(command);
+    for item in &results {
+        let label = match item.level {
+            Level::Error => "ERROR",
+            Level::Warning => "WARN",
+            Level::Info => "INFO",
+        };
+        println!("{label} {}: {}", item.code, item.message);
+        if let Some(remedy) = &item.remedy {
+            println!("  fix: {remedy}");
+        }
+    }
+    results.iter().any(|f| f.level == Level::Error)
+}
+
 fn print_target_findings(target: &str, command: &[OsString]) -> bool {
     match target {
         "cron" => print_findings(command),
         "systemd" => print_systemd_findings(command),
+        "launchd" => print_launchd_findings(command),
         _ => unreachable!(),
     }
 }
@@ -631,9 +708,13 @@ fn main() -> ExitCode {
         "diff" => {
             if invocation.target == "cron" {
                 diff(&invocation.command);
-            } else {
+            } else if invocation.target == "systemd" {
                 println!(
                     "Apux context diff: local → systemd\n  PATH: local value → {SYSTEMD_PATH}\n  SHELL: local value → <absent>\n  TERM: local value → <absent>\n  working directory: local value → / unless WorkingDirectory= is declared"
+                );
+            } else {
+                println!(
+                    "Apux context diff: local → launchd\n  PATH: local value → {LAUNCHD_PATH}\n  SHELL: local value → <absent>\n  TERM: local value → <absent>\n  working directory: local value → / unless WorkingDirectory is declared\n  environment: terminal exports → only EnvironmentVariables declared in the plist"
                 );
             }
             ExitCode::SUCCESS
@@ -654,7 +735,10 @@ fn main() -> ExitCode {
             }
         },
         "init" => {
-            eprintln!("error: `init --target systemd` is coming next; use check and verify today");
+            eprintln!(
+                "error: `init` currently generates cron wrappers only; use check and verify for {} today",
+                invocation.target
+            );
             ExitCode::from(2)
         }
         "verify" => {
