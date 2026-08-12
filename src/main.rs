@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -86,9 +86,25 @@ struct ExecutionContract {
     image: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeEvidence {
+    version: u8,
+    recorded_at_unix_seconds: u64,
+    target: String,
+    command: Vec<String>,
+    working_directory: PathBuf,
+    path: Option<String>,
+    shell: Option<String>,
+    image: Option<String>,
+    hostname: Option<String>,
+    user: Option<String>,
+    required_env_present: BTreeMap<String, bool>,
+    exit_code: i32,
+}
+
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|debug|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run|debug> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux debug --target cron -- ./scripts/nightly-sync.sh\n  apux debug --target docker --image node:22 -- npm test"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|debug|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run|debug> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux record --contract [apux.yaml]\n  apux diff --last-run [--contract apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux record --contract apux.yaml\n  apux diff --last-run\n  apux debug --target cron -- ./scripts/nightly-sync.sh"
     );
 }
 
@@ -157,7 +173,7 @@ fn parse_args() -> Result<Invocation, String> {
     }
     if !matches!(
         action.as_str(),
-        "check" | "diff" | "run" | "debug" | "init" | "verify" | "inspect"
+        "check" | "diff" | "run" | "record" | "debug" | "init" | "verify" | "inspect"
     ) {
         return Err(format!("unknown command: {action}"));
     }
@@ -209,6 +225,45 @@ fn parse_args() -> Result<Invocation, String> {
         return Ok(Invocation {
             action,
             target: "contract".into(),
+            command: vec![],
+            contract,
+            image: None,
+            workflow: None,
+            job: None,
+            step: None,
+        });
+    }
+    if action == "record" && first_flag.as_deref() == Some(std::ffi::OsStr::new("--contract")) {
+        let contract = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("apux.yaml"));
+        if args.next().is_some() {
+            return Err("record --contract accepts one optional contract path".into());
+        }
+        return Ok(Invocation {
+            action,
+            target: "contract".into(),
+            command: vec![],
+            contract,
+            image: None,
+            workflow: None,
+            job: None,
+            step: None,
+        });
+    }
+    if action == "diff" && first_flag.as_deref() == Some(std::ffi::OsStr::new("--last-run")) {
+        let contract = match args.next() {
+            None => PathBuf::from("apux.yaml"),
+            Some(flag) if flag == "--contract" => PathBuf::from(
+                args.next()
+                    .ok_or("missing contract path after --contract")?,
+            ),
+            Some(_) => return Err("diff --last-run accepts only optional --contract <path>".into()),
+        };
+        return Ok(Invocation {
+            action,
+            target: "evidence".into(),
             command: vec![],
             contract,
             image: None,
@@ -1203,6 +1258,127 @@ fn run_contract(path: &Path) -> Result<i32, String> {
     }
 }
 
+fn evidence_path(contract_path: &Path) -> PathBuf {
+    contract_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".apux/last-run.yaml")
+}
+
+fn capture_evidence(contract: &ExecutionContract, exit_code: i32) -> RuntimeEvidence {
+    RuntimeEvidence {
+        version: 1,
+        recorded_at_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        target: contract.target.clone(),
+        command: contract.command.clone(),
+        working_directory: contract.working_directory.clone(),
+        path: contract.path.clone(),
+        shell: contract.shell.clone(),
+        image: contract.image.clone(),
+        hostname: env::var("HOSTNAME").ok(),
+        user: env::var("USER").ok(),
+        required_env_present: contract
+            .required_env
+            .iter()
+            .map(|name| (name.clone(), env::var_os(name).is_some()))
+            .collect(),
+        exit_code,
+    }
+}
+
+fn record_contract(path: &Path) -> Result<i32, String> {
+    let contract = read_contract(path)?;
+    let result = run_contract(path);
+    let exit_code = result.unwrap_or(1);
+    let destination = evidence_path(path);
+    fs::create_dir_all(destination.parent().expect("evidence parent"))
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        &destination,
+        serde_yaml::to_string(&capture_evidence(&contract, exit_code))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    println!(
+        "Recorded non-secret runtime evidence at {}",
+        destination.display()
+    );
+    Ok(exit_code)
+}
+
+fn diff_last_run(path: &Path) -> Result<(), String> {
+    let destination = evidence_path(path);
+    let previous: RuntimeEvidence =
+        serde_yaml::from_str(&fs::read_to_string(&destination).map_err(|error| {
+            format!(
+                "cannot read {}: {error}; run `apux record --contract {}` first",
+                destination.display(),
+                path.display()
+            )
+        })?)
+        .map_err(|error| format!("invalid runtime evidence: {error}"))?;
+    let contract = read_contract(path)?;
+    let current = capture_evidence(&contract, previous.exit_code);
+    println!(
+        "Apux runtime evidence diff\n  baseline: {}\n",
+        destination.display()
+    );
+    let pairs = [
+        ("target", previous.target, current.target),
+        (
+            "command",
+            previous.command.join(" "),
+            current.command.join(" "),
+        ),
+        (
+            "working directory",
+            previous.working_directory.display().to_string(),
+            current.working_directory.display().to_string(),
+        ),
+        (
+            "PATH",
+            previous.path.unwrap_or_else(|| "<default>".into()),
+            current.path.unwrap_or_else(|| "<default>".into()),
+        ),
+        (
+            "shell",
+            previous.shell.unwrap_or_else(|| "<none>".into()),
+            current.shell.unwrap_or_else(|| "<none>".into()),
+        ),
+        (
+            "image",
+            previous.image.unwrap_or_else(|| "<none>".into()),
+            current.image.unwrap_or_else(|| "<none>".into()),
+        ),
+        (
+            "hostname",
+            previous.hostname.unwrap_or_else(|| "<unknown>".into()),
+            current.hostname.unwrap_or_else(|| "<unknown>".into()),
+        ),
+    ];
+    let mut changed = false;
+    for (label, old, new) in pairs {
+        if old != new {
+            changed = true;
+            println!("~ {label}\n  recorded: {old}\n  current:  {new}");
+        }
+    }
+    if previous.required_env_present != current.required_env_present {
+        changed = true;
+        println!(
+            "~ required environment availability\n  recorded: {:?}\n  current:  {:?}",
+            previous.required_env_present, current.required_env_present
+        );
+    }
+    if !changed {
+        println!("✓ No execution-context drift detected since the recorded run.");
+    }
+    Ok(())
+}
+
 fn diff(command: &[OsString]) {
     println!(
         "Apux context diff: local → cron\n  command: {}\n",
@@ -1443,7 +1619,15 @@ fn main() -> ExitCode {
             }
         }
         "diff" => {
-            if invocation.target == "cron" {
+            if invocation.target == "evidence" {
+                return match diff_last_run(&invocation.contract) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::from(1)
+                    }
+                };
+            } else if invocation.target == "cron" {
                 diff(&invocation.command);
             } else if invocation.target == "systemd" {
                 println!(
@@ -1472,6 +1656,16 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "record" if invocation.target == "contract" => {
+            match record_contract(&invocation.contract) {
+                Ok(0) => ExitCode::SUCCESS,
+                Ok(code) => ExitCode::from(code as u8),
+                Err(error) => {
+                    eprintln!("error: could not record contract: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "run" if invocation.target == "docker" => match invocation.image.as_deref() {
             Some(image) => match run_docker(&invocation.command, image) {
                 Ok(0) => ExitCode::SUCCESS,
