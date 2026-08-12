@@ -125,7 +125,7 @@ struct RuntimeEvidence {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|debug|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run|debug> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux record --contract [apux.yaml]\n  apux diff --last-run [--contract apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux record --contract apux.yaml\n  apux diff --last-run\n  apux debug --target cron -- ./scripts/nightly-sync.sh"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|debug|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run|debug> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux record --contract [apux.yaml]\n  apux diff --last-run [--contract apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n  apux doctor [--json]\n\nEXAMPLES:\n  apux doctor --json\n  apux record --contract apux.yaml\n  apux debug --target cron -- ./scripts/nightly-sync.sh"
     );
 }
 
@@ -194,9 +194,29 @@ fn parse_args() -> Result<Invocation, String> {
     }
     if !matches!(
         action.as_str(),
-        "check" | "diff" | "run" | "record" | "debug" | "init" | "verify" | "inspect"
+        "check" | "diff" | "run" | "record" | "debug" | "init" | "verify" | "inspect" | "doctor"
     ) {
         return Err(format!("unknown command: {action}"));
+    }
+    if action == "doctor" {
+        let json = match args.next() {
+            None => false,
+            Some(flag) if flag == "--json" => true,
+            Some(_) => return Err("doctor accepts only optional --json".into()),
+        };
+        if args.next().is_some() {
+            return Err("doctor accepts only optional --json".into());
+        }
+        return Ok(Invocation {
+            action: if json { "doctor-json".into() } else { action },
+            target: "doctor".into(),
+            command: vec![],
+            contract: PathBuf::from("apux.yaml"),
+            image: None,
+            workflow: None,
+            job: None,
+            step: None,
+        });
     }
     if action == "inspect" {
         let integration = args
@@ -819,6 +839,67 @@ fn print_target_findings(target: &str, command: &[OsString]) -> bool {
 
 fn docker_available() -> bool {
     find_on_path("docker").is_some()
+}
+
+#[derive(Serialize)]
+struct DoctorReport {
+    docker_binary: bool,
+    docker_daemon: bool,
+    apux_contract_present: bool,
+    current_directory: String,
+}
+
+fn doctor_report() -> DoctorReport {
+    let docker_binary = docker_available();
+    let docker_daemon = docker_binary
+        && Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+    DoctorReport {
+        docker_binary,
+        docker_daemon,
+        apux_contract_present: Path::new("apux.yaml").is_file(),
+        current_directory: env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into()),
+    }
+}
+
+fn doctor(json: bool) -> bool {
+    let report = doctor_report();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("doctor report serialization")
+        );
+    } else {
+        println!(
+            "Apux doctor\n  directory: {}\n  Docker binary: {}\n  Docker daemon: {}\n  apux.yaml: {}",
+            report.current_directory,
+            if report.docker_binary {
+                "available"
+            } else {
+                "missing"
+            },
+            if report.docker_daemon {
+                "available"
+            } else {
+                "unavailable"
+            },
+            if report.apux_contract_present {
+                "found"
+            } else {
+                "not found"
+            }
+        );
+        if !report.docker_daemon {
+            println!(
+                "\nDocker is optional for cron/systemd/launchd checks. Start Docker to use Docker runs, debug shells, and GitHub Actions replay."
+            );
+        }
+    }
+    false
 }
 
 fn yaml_field<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
@@ -1698,6 +1779,13 @@ fn main() -> ExitCode {
         }
     };
     match invocation.action.as_str() {
+        "doctor" | "doctor-json" => {
+            if doctor(invocation.action == "doctor-json") {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         "check" => {
             let failed = if invocation.target == "docker" {
                 print_docker_findings(&invocation.command, invocation.image.as_deref())
@@ -1895,6 +1983,21 @@ mod tests {
         assert_eq!(
             contract.required_env[0].source(),
             Some("env://LOCAL_API_TOKEN")
+        );
+    }
+
+    #[test]
+    fn doctor_report_serializes_to_json() {
+        let report = DoctorReport {
+            docker_binary: true,
+            docker_daemon: false,
+            apux_contract_present: true,
+            current_directory: "/tmp".into(),
+        };
+        assert!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .contains("\"docker_binary\":true")
         );
     }
 
