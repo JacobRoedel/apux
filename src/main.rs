@@ -10,6 +10,7 @@ use std::{
 
 const CRON_PATH: &str = "/usr/bin:/bin";
 const CRON_SHELL: &str = "/bin/sh";
+const SYSTEMD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -56,6 +57,7 @@ impl Finding {
 #[derive(Debug)]
 struct Invocation {
     action: String,
+    target: String,
     command: Vec<OsString>,
     contract: PathBuf,
 }
@@ -78,7 +80,7 @@ struct ExecutionContract {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target cron -- <command> [args...]\n  apux verify --target cron [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux verify --target cron\n  apux run --target cron -- node scripts/sync.js"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd> -- <command> [args...]\n  apux verify --target <cron|systemd> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target systemd -- /usr/local/bin/nightly-sync\n  apux verify --target cron"
     );
 }
 
@@ -106,9 +108,9 @@ fn parse_args() -> Result<Invocation, String> {
         .ok_or("missing target after --target")?
         .to_string_lossy()
         .to_string();
-    if target != "cron" {
+    if !matches!(target.as_str(), "cron" | "systemd") {
         return Err(format!(
-            "unsupported target: {target}. The MVP supports cron."
+            "unsupported target: {target}. Supported targets: cron, systemd."
         ));
     }
     if action == "verify" {
@@ -122,6 +124,7 @@ fn parse_args() -> Result<Invocation, String> {
         };
         return Ok(Invocation {
             action,
+            target,
             command: vec![],
             contract,
         });
@@ -135,6 +138,7 @@ fn parse_args() -> Result<Invocation, String> {
     }
     Ok(Invocation {
         action,
+        target,
         command,
         contract: PathBuf::from("apux.yaml"),
     })
@@ -355,6 +359,99 @@ fn print_findings(command: &[OsString]) -> bool {
     results.iter().any(|f| f.level == Level::Error)
 }
 
+fn systemd_findings(command: &[OsString]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let program = command_path(command);
+    let program_s = program.to_string_lossy();
+    if !program.is_absolute() {
+        out.push(Finding::error(
+            "APX030",
+            format!(
+                "systemd ExecStart requires an absolute executable path; `{program_s}` is relative"
+            ),
+            "use an absolute executable path, e.g. /usr/local/bin/job",
+        ));
+    } else if !program.is_file() {
+        out.push(Finding::error(
+            "APX001",
+            format!("command path `{program_s}` does not exist"),
+            "check the path on the service host",
+        ));
+    }
+    #[cfg(unix)]
+    if program.is_file() {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(&program)
+            .map(|m| m.permissions().mode() & 0o111 == 0)
+            .unwrap_or(false)
+        {
+            out.push(Finding::warning(
+                "APX002",
+                format!("`{program_s}` is not executable"),
+                "run chmod +x, or invoke it through its interpreter",
+            ));
+        }
+    }
+    if command.iter().skip(1).any(|arg| {
+        matches!(
+            arg.to_string_lossy().as_ref(),
+            "|" | "&&" | "||" | ";" | ">" | ">>"
+        )
+    }) {
+        out.push(Finding::warning(
+            "APX031",
+            "systemd does not run ExecStart through a shell",
+            "use a wrapper script for pipes, redirects, or shell control operators",
+        ));
+    }
+    if let Some(content) = file_contents(command) {
+        let refs: Vec<_> = referenced_env(&content)
+            .into_iter()
+            .filter(|n| !["PATH", "HOME", "PWD", "SHELL", "USER"].contains(&n.as_str()))
+            .collect();
+        if !refs.is_empty() {
+            out.push(Finding::warning("APX005", format!("script references environment variables a systemd service will not inherit: {}", refs.join(", ")), "set Environment= or EnvironmentFile= explicitly in the unit"));
+        }
+        if content.contains("./") || content.contains("../") {
+            out.push(Finding::warning(
+                "APX009",
+                "script uses relative paths",
+                "set WorkingDirectory= in the unit",
+            ));
+        }
+    }
+    out.push(Finding::info("APX032", "systemd sends standard output and error to the journal by default; inspect with journalctl -u <unit>"));
+    out
+}
+
+fn print_systemd_findings(command: &[OsString]) -> bool {
+    println!(
+        "Apux preflight: systemd\n  command: {}\n  shell:   none (ExecStart runs directly)\n  PATH:    {SYSTEMD_PATH}\n",
+        command_display(command)
+    );
+    let results = systemd_findings(command);
+    for item in &results {
+        let label = match item.level {
+            Level::Error => "ERROR",
+            Level::Warning => "WARN",
+            Level::Info => "INFO",
+        };
+        println!("{label} {}: {}", item.code, item.message);
+        if let Some(remedy) = &item.remedy {
+            println!("  fix: {remedy}");
+        }
+    }
+    results.iter().any(|f| f.level == Level::Error)
+}
+
+fn print_target_findings(target: &str, command: &[OsString]) -> bool {
+    match target {
+        "cron" => print_findings(command),
+        "systemd" => print_systemd_findings(command),
+        _ => unreachable!(),
+    }
+}
+
 fn run_cron(command: &[OsString]) -> io::Result<i32> {
     let home = env::var_os("HOME").unwrap_or_else(|| OsString::from("/"));
     let status = Command::new(&command[0])
@@ -455,7 +552,7 @@ fn verify_contract(path: &Path, target: &str) -> bool {
         has_errors = true;
     }
     let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
-    has_errors |= print_findings(&command);
+    has_errors |= print_target_findings(target, &command);
     if !contract.required_env.is_empty() {
         println!(
             "INFO APX026: required environment names are declared: {}",
@@ -525,14 +622,20 @@ fn main() -> ExitCode {
     };
     match invocation.action.as_str() {
         "check" => {
-            if print_findings(&invocation.command) {
+            if print_target_findings(&invocation.target, &invocation.command) {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
             }
         }
         "diff" => {
-            diff(&invocation.command);
+            if invocation.target == "cron" {
+                diff(&invocation.command);
+            } else {
+                println!(
+                    "Apux context diff: local → systemd\n  PATH: local value → {SYSTEMD_PATH}\n  SHELL: local value → <absent>\n  TERM: local value → <absent>\n  working directory: local value → / unless WorkingDirectory= is declared"
+                );
+            }
             ExitCode::SUCCESS
         }
         "run" => match run_cron(&invocation.command) {
@@ -543,15 +646,19 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        "init" => match init(&invocation.command) {
+        "init" if invocation.target == "cron" => match init(&invocation.command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: could not create Apux files: {error}");
                 ExitCode::from(1)
             }
         },
+        "init" => {
+            eprintln!("error: `init --target systemd` is coming next; use check and verify today");
+            ExitCode::from(2)
+        }
         "verify" => {
-            if verify_contract(&invocation.contract, "cron") {
+            if verify_contract(&invocation.contract, &invocation.target) {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
