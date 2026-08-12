@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     env,
@@ -56,11 +57,28 @@ impl Finding {
 struct Invocation {
     action: String,
     command: Vec<OsString>,
+    contract: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExecutionContract {
+    version: u8,
+    target: String,
+    command: Vec<String>,
+    working_directory: PathBuf,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    required_env: Vec<String>,
+    #[serde(default)]
+    log: Option<PathBuf>,
 }
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target cron -- <command> [args...]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux run --target cron -- node scripts/sync.js"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target cron -- <command> [args...]\n  apux verify --target cron [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux verify --target cron\n  apux run --target cron -- node scripts/sync.js"
     );
 }
 
@@ -74,7 +92,10 @@ fn parse_args() -> Result<Invocation, String> {
         std::process::exit(0);
     }
     let action = action.to_string_lossy().to_string();
-    if !matches!(action.as_str(), "check" | "diff" | "run" | "init") {
+    if !matches!(
+        action.as_str(),
+        "check" | "diff" | "run" | "init" | "verify"
+    ) {
         return Err(format!("unknown command: {action}"));
     }
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--target")) {
@@ -90,6 +111,21 @@ fn parse_args() -> Result<Invocation, String> {
             "unsupported target: {target}. The MVP supports cron."
         ));
     }
+    if action == "verify" {
+        let next = args.next();
+        let contract = match next.as_deref() {
+            None => PathBuf::from("apux.yaml"),
+            Some(flag) if flag == std::ffi::OsStr::new("--contract") => {
+                PathBuf::from(args.next().ok_or("missing path after --contract")?)
+            }
+            Some(_) => return Err("verify accepts only optional --contract <path>".into()),
+        };
+        return Ok(Invocation {
+            action,
+            command: vec![],
+            contract,
+        });
+    }
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
         return Err("place the command after --".into());
     }
@@ -97,7 +133,11 @@ fn parse_args() -> Result<Invocation, String> {
     if command.is_empty() {
         return Err("missing command after --".into());
     }
-    Ok(Invocation { action, command })
+    Ok(Invocation {
+        action,
+        command,
+        contract: PathBuf::from("apux.yaml"),
+    })
 }
 
 fn command_display(command: &[OsString]) -> String {
@@ -362,6 +402,75 @@ fn diff(command: &[OsString]) {
     }
 }
 
+fn read_contract(path: &Path) -> Result<ExecutionContract, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_yaml::from_str(&contents).map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn verify_contract(path: &Path, target: &str) -> bool {
+    let contract = match read_contract(path) {
+        Ok(contract) => contract,
+        Err(error) => {
+            println!("ERROR APX020: {error}");
+            return true;
+        }
+    };
+    let mut has_errors = false;
+    println!(
+        "Apux contract verification: {}\n  contract: {}\n",
+        target,
+        path.display()
+    );
+    if contract.version != 1 {
+        println!(
+            "ERROR APX021: unsupported contract version {}",
+            contract.version
+        );
+        has_errors = true;
+    }
+    if contract.target != target {
+        println!(
+            "ERROR APX022: contract target `{}` does not match `--target {target}`",
+            contract.target
+        );
+        has_errors = true;
+    }
+    if contract.command.is_empty() {
+        println!("ERROR APX023: contract command is empty");
+        return true;
+    }
+    if !contract.working_directory.is_dir() {
+        println!(
+            "ERROR APX024: working directory `{}` does not exist",
+            contract.working_directory.display()
+        );
+        has_errors = true;
+    }
+    if let Some(shell) = &contract.shell
+        && !Path::new(shell).exists()
+        && shell.starts_with('/')
+    {
+        println!("ERROR APX025: declared shell `{shell}` does not exist");
+        has_errors = true;
+    }
+    let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
+    has_errors |= print_findings(&command);
+    if !contract.required_env.is_empty() {
+        println!(
+            "INFO APX026: required environment names are declared: {}",
+            contract.required_env.join(", ")
+        );
+        println!(
+            "  ensure your scheduler injects these values; Apux never reads or stores their values."
+        );
+    }
+    if contract.log.is_none() {
+        println!("WARN APX027: contract has no declared log destination");
+    }
+    has_errors
+}
+
 fn init(command: &[OsString]) -> io::Result<()> {
     let root = env::current_dir()?;
     let apux_dir = root.join(".apux");
@@ -381,14 +490,23 @@ fn init(command: &[OsString]) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
     }
-    let contract = format!(
-        "version: 1\ntarget: cron\ncommand: {}\nworking_directory: {}\nshell: /usr/bin/env bash\npath: {}\nlog: {}\n",
-        command_display(command),
-        root.display(),
-        CRON_PATH,
-        log_path.display()
-    );
-    fs::write(root.join("apux.yaml"), contract)?;
+    let contract = ExecutionContract {
+        version: 1,
+        target: "cron".into(),
+        command: command
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect(),
+        working_directory: root.clone(),
+        shell: Some("/usr/bin/env bash".into()),
+        path: Some(CRON_PATH.into()),
+        required_env: vec![],
+        log: Some(log_path),
+    };
+    fs::write(
+        root.join("apux.yaml"),
+        serde_yaml::to_string(&contract).map_err(io::Error::other)?,
+    )?;
     println!(
         "Created .apux/run.sh and apux.yaml.\n\nReview them, then add a schedule like:\n  0 2 * * * {}\n",
         wrapper_path.display()
@@ -432,6 +550,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "verify" => {
+            if verify_contract(&invocation.contract, "cron") {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -450,5 +575,13 @@ mod tests {
     fn quotes_shell_arguments() {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("bin/run"), "bin/run");
+    }
+
+    #[test]
+    fn parses_execution_contract() {
+        let value = "version: 1\ntarget: cron\ncommand:\n  - /bin/echo\n  - hello\nworking_directory: /tmp\nrequired_env:\n  - API_TOKEN\n";
+        let contract: ExecutionContract = serde_yaml::from_str(value).unwrap();
+        assert_eq!(contract.command, ["/bin/echo", "hello"]);
+        assert_eq!(contract.required_env, ["API_TOKEN"]);
     }
 }
