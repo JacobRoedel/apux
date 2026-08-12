@@ -140,3 +140,14 @@ resolved value; evidence records only source availability.
 cargo test
 cargo run -- check --target cron -- ./example.sh
 ```
+
+## Automation-friendly output
+
+```sh
+apux doctor
+apux doctor --json
+```
+
+`doctor` tests local prerequisites without modifying state. The repository also
+checks formatting, Clippy, and tests on pull requests; version tags build a
+release artifact.
