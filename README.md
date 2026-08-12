@@ -27,6 +27,11 @@ apux run --target cron -- ./scripts/nightly-sync.sh
 # Generate an explicit wrapper and starter contract (does not install a crontab).
 apux init --target cron -- ./scripts/nightly-sync.sh
 
+# Generate native, reviewable scheduler artifacts. Nothing is installed.
+apux init --target systemd -- /usr/local/bin/nightly-sync
+apux init --target launchd -- /usr/local/bin/nightly-sync
+apux init --target docker --image node:22 -- npm run nightly
+
 # Verify the declared command, working directory, shell, paths, and required
 # environment *names* in apux.yaml.
 apux verify --target cron
@@ -93,9 +98,10 @@ or store secrets.
 
 ## Generated files
 
-`apux init` writes `apux.yaml` and `.apux/run.sh`. The wrapper makes the working
-directory, shell, PATH, and logging destination explicit. Review it, change the
-project-specific values, then add the printed line to your crontab yourself.
+`apux init` writes `apux.yaml` plus a target-native artifact in `.apux/`: a cron
+wrapper, systemd unit, launchd plist, or Docker Compose file. Review it, change
+project-specific values, then install or run it yourself. Apux never changes a
+scheduler automatically.
 
 The contract intentionally records only required environment-variable names in
 `required_env`; never put secret values in `apux.yaml`.
