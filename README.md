@@ -113,9 +113,12 @@ or store secrets.
 ## Generated files
 
 `apux init` writes `apux.yaml` plus a target-native artifact in `.apux/`: a cron
-wrapper, systemd unit, launchd plist, or Docker Compose file. Review it, change
-project-specific values, then install or run it yourself. Apux never changes a
-scheduler automatically.
+wrapper, systemd unit, launchd plist, or Docker Compose file. The generated cron,
+systemd, and launchd artifacts are standalone: they run your command directly and
+do not need the Apux binary or YAML file at scheduler runtime. `apux.yaml` stays
+available for local `run`, `debug`, `verify`, and evidence workflows. Review the
+artifact, change project-specific values, then install or run it yourself. Apux
+never changes a scheduler automatically.
 
 The contract intentionally records only required environment-variable names in
 `required_env`; never put secret values in `apux.yaml`.
