@@ -3,8 +3,8 @@
 Apux is a preflight tool for unattended commands. It exposes the hidden execution
 context that makes a command work in a developer terminal but fail under cron.
 
-> Early MVP: cron is the first supported target. systemd, launchd, Docker, and
-> CI adapters are planned.
+> Apux currently supports cron and systemd preflight checks. launchd, Docker,
+> and CI adapters are planned.
 
 ## Install from source
 
@@ -30,6 +30,9 @@ apux init --target cron -- ./scripts/nightly-sync.sh
 # Verify the declared command, working directory, shell, paths, and required
 # environment *names* in apux.yaml.
 apux verify --target cron
+
+# systemd has different rules: no implicit shell and an absolute ExecStart path.
+apux check --target systemd -- /usr/local/bin/nightly-sync
 ```
 
 `check` is intentionally conservative: warnings are hypotheses to inspect, not
@@ -46,6 +49,7 @@ with an empty environment and adds only cron's normal shell, PATH, and HOME.
 - relative paths, `~`, and working-directory assumptions
 - commands found locally but absent from cron's standard PATH
 - absent logging/redirection
+- systemd `ExecStart` requirements, direct-execution behavior, and journal logs
 
 Apux never prints environment-variable values in `diff`, and it does not read
 or store secrets.
