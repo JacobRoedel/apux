@@ -1255,7 +1255,7 @@ fn init(target: &str, command: &[OsString], image: Option<&str>) -> io::Result<(
         shell: (target == "cron").then(|| "/usr/bin/env bash".into()),
         path: (target == "cron").then(|| CRON_PATH.into()),
         required_env: vec![],
-        log: Some(log_path),
+        log: Some(log_path.clone()),
         image: image.map(str::to_owned),
     };
     fs::write(
