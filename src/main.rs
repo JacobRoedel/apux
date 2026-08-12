@@ -61,6 +61,7 @@ struct Invocation {
     target: String,
     command: Vec<OsString>,
     contract: PathBuf,
+    image: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,11 +78,13 @@ struct ExecutionContract {
     required_env: Vec<String>,
     #[serde(default)]
     log: Option<PathBuf>,
+    #[serde(default)]
+    image: Option<String>,
 }
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target systemd -- /usr/local/bin/nightly-sync\n  apux check --target launchd -- /usr/local/bin/nightly-sync\n  apux verify --target cron"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target docker --image node:22 -- npm test\n  apux run --target docker --image node:22 -- npm test\n  apux verify --target cron"
     );
 }
 
@@ -109,9 +112,9 @@ fn parse_args() -> Result<Invocation, String> {
         .ok_or("missing target after --target")?
         .to_string_lossy()
         .to_string();
-    if !matches!(target.as_str(), "cron" | "systemd" | "launchd") {
+    if !matches!(target.as_str(), "cron" | "systemd" | "launchd" | "docker") {
         return Err(format!(
-            "unsupported target: {target}. Supported targets: cron, systemd, launchd."
+            "unsupported target: {target}. Supported targets: cron, systemd, launchd, docker."
         ));
     }
     if action == "verify" {
@@ -128,9 +131,22 @@ fn parse_args() -> Result<Invocation, String> {
             target,
             command: vec![],
             contract,
+            image: None,
         });
     }
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let mut next = args.next();
+    let image = if next.as_deref() == Some(std::ffi::OsStr::new("--image")) {
+        let image = args
+            .next()
+            .ok_or("missing image after --image")?
+            .to_string_lossy()
+            .to_string();
+        next = args.next();
+        Some(image)
+    } else {
+        None
+    };
+    if next.as_deref() != Some(std::ffi::OsStr::new("--")) {
         return Err("place the command after --".into());
     }
     let command: Vec<_> = args.collect();
@@ -142,6 +158,7 @@ fn parse_args() -> Result<Invocation, String> {
         target,
         command,
         contract: PathBuf::from("apux.yaml"),
+        image,
     })
 }
 
@@ -525,8 +542,42 @@ fn print_target_findings(target: &str, command: &[OsString]) -> bool {
         "cron" => print_findings(command),
         "systemd" => print_systemd_findings(command),
         "launchd" => print_launchd_findings(command),
+        "docker" => false,
         _ => unreachable!(),
     }
+}
+
+fn docker_available() -> bool {
+    find_on_path("docker").is_some()
+}
+
+fn print_docker_findings(command: &[OsString], image: Option<&str>) -> bool {
+    println!(
+        "Apux preflight: docker\n  command: {}\n  image:   {}\n  workdir: /workspace (current directory mounted)\n",
+        command_display(command),
+        image.unwrap_or("<missing>")
+    );
+    let mut errors = false;
+    if image.is_none_or(str::is_empty) {
+        println!("ERROR APX050: Docker target requires --image <image>");
+        errors = true;
+    }
+    if !docker_available() {
+        println!("ERROR APX051: docker is not on PATH");
+        errors = true;
+    }
+    if command
+        .first()
+        .is_some_and(|part| part.to_string_lossy().starts_with("./"))
+    {
+        println!(
+            "WARN APX052: relative executable path depends on the image working directory\n  fix: set WORKDIR in the image or use an absolute path"
+        );
+    }
+    println!(
+        "INFO APX053: `run` will mount the current directory read-write at /workspace; inspect the image and command before executing."
+    );
+    errors
 }
 
 fn run_cron(command: &[OsString]) -> io::Result<i32> {
@@ -542,6 +593,24 @@ fn run_cron(command: &[OsString]) -> io::Result<i32> {
             env::var("USER").unwrap_or_else(|_| "unknown".into()),
         )
         .current_dir(env::current_dir()?)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn run_docker(command: &[OsString], image: &str) -> io::Result<i32> {
+    let cwd = env::current_dir()?;
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--init",
+            "--workdir",
+            "/workspace",
+            "--volume",
+        ])
+        .arg(format!("{}:/workspace", cwd.display()))
+        .arg(image)
+        .args(command)
         .status()?;
     Ok(status.code().unwrap_or(1))
 }
@@ -629,7 +698,11 @@ fn verify_contract(path: &Path, target: &str) -> bool {
         has_errors = true;
     }
     let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
-    has_errors |= print_target_findings(target, &command);
+    if target == "docker" {
+        has_errors |= print_docker_findings(&command, contract.image.as_deref());
+    } else {
+        has_errors |= print_target_findings(target, &command);
+    }
     if !contract.required_env.is_empty() {
         println!(
             "INFO APX026: required environment names are declared: {}",
@@ -676,6 +749,7 @@ fn init(command: &[OsString]) -> io::Result<()> {
         path: Some(CRON_PATH.into()),
         required_env: vec![],
         log: Some(log_path),
+        image: None,
     };
     fs::write(
         root.join("apux.yaml"),
@@ -699,7 +773,12 @@ fn main() -> ExitCode {
     };
     match invocation.action.as_str() {
         "check" => {
-            if print_target_findings(&invocation.target, &invocation.command) {
+            let failed = if invocation.target == "docker" {
+                print_docker_findings(&invocation.command, invocation.image.as_deref())
+            } else {
+                print_target_findings(&invocation.target, &invocation.command)
+            };
+            if failed {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
@@ -712,13 +791,35 @@ fn main() -> ExitCode {
                 println!(
                     "Apux context diff: local → systemd\n  PATH: local value → {SYSTEMD_PATH}\n  SHELL: local value → <absent>\n  TERM: local value → <absent>\n  working directory: local value → / unless WorkingDirectory= is declared"
                 );
-            } else {
+            } else if invocation.target == "launchd" {
                 println!(
                     "Apux context diff: local → launchd\n  PATH: local value → {LAUNCHD_PATH}\n  SHELL: local value → <absent>\n  TERM: local value → <absent>\n  working directory: local value → / unless WorkingDirectory is declared\n  environment: terminal exports → only EnvironmentVariables declared in the plist"
+                );
+            } else {
+                println!(
+                    "Apux context diff: local → docker\n  filesystem: host checkout → mounted at /workspace\n  working directory: {} → /workspace\n  environment: terminal exports → image-defined unless passed with --env\n  executable versions: host → image `{}`",
+                    env::current_dir()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|_| "<unknown>".into()),
+                    invocation.image.as_deref().unwrap_or("<missing>")
                 );
             }
             ExitCode::SUCCESS
         }
+        "run" if invocation.target == "docker" => match invocation.image.as_deref() {
+            Some(image) => match run_docker(&invocation.command, image) {
+                Ok(0) => ExitCode::SUCCESS,
+                Ok(code) => ExitCode::from(code as u8),
+                Err(error) => {
+                    eprintln!("error: failed to start docker: {error}");
+                    ExitCode::from(1)
+                }
+            },
+            None => {
+                eprintln!("error: Docker target requires --image <image>");
+                ExitCode::from(2)
+            }
+        },
         "run" => match run_cron(&invocation.command) {
             Ok(0) => ExitCode::SUCCESS,
             Ok(code) => ExitCode::from(code as u8),
