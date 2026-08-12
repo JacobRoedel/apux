@@ -65,6 +65,7 @@ struct Invocation {
     image: Option<String>,
     workflow: Option<PathBuf>,
     job: Option<String>,
+    step: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +102,59 @@ fn parse_args() -> Result<Invocation, String> {
         std::process::exit(0);
     }
     let action = action.to_string_lossy().to_string();
+    if action == "gha" {
+        let gha_action = args
+            .next()
+            .ok_or("expected `run` or `step` after `apux gha`")?
+            .to_string_lossy()
+            .to_string();
+        if !matches!(gha_action.as_str(), "run" | "step") {
+            return Err("GitHub Actions supports `apux gha run` and `apux gha step`".into());
+        }
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--workflow")) {
+            return Err("expected --workflow <workflow.yml>".into());
+        }
+        let workflow = PathBuf::from(
+            args.next()
+                .ok_or("missing workflow path after --workflow")?,
+        );
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--job")) {
+            return Err("expected --job <job-id>".into());
+        }
+        let job = Some(
+            args.next()
+                .ok_or("missing job id after --job")?
+                .to_string_lossy()
+                .to_string(),
+        );
+        let step = if gha_action == "step" {
+            if args.next().as_deref() != Some(std::ffi::OsStr::new("--at")) {
+                return Err("expected --at <step-number>".into());
+            }
+            Some(
+                args.next()
+                    .ok_or("missing step number after --at")?
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| "step number must be a positive integer")?,
+            )
+        } else {
+            None
+        };
+        if args.next().is_some() {
+            return Err("unexpected extra GitHub Actions argument".into());
+        }
+        return Ok(Invocation {
+            action: format!("gha-{gha_action}"),
+            target: "github-actions".into(),
+            command: vec![],
+            contract: PathBuf::from("apux.yaml"),
+            image: None,
+            workflow: Some(workflow),
+            job,
+            step,
+        });
+    }
     if !matches!(
         action.as_str(),
         "check" | "diff" | "run" | "init" | "verify" | "inspect"
@@ -140,6 +194,7 @@ fn parse_args() -> Result<Invocation, String> {
             image: None,
             workflow: Some(workflow),
             job,
+            step: None,
         });
     }
     let first_flag = args.next();
@@ -159,6 +214,7 @@ fn parse_args() -> Result<Invocation, String> {
             image: None,
             workflow: None,
             job: None,
+            step: None,
         });
     }
     if first_flag.as_deref() != Some(std::ffi::OsStr::new("--target")) {
@@ -191,6 +247,7 @@ fn parse_args() -> Result<Invocation, String> {
             image: None,
             workflow: None,
             job: None,
+            step: None,
         });
     }
     let mut next = args.next();
@@ -220,6 +277,7 @@ fn parse_args() -> Result<Invocation, String> {
         image,
         workflow: None,
         job: None,
+        step: None,
     })
 }
 
@@ -712,6 +770,119 @@ fn inspect_github_actions(path: &Path, selected_job: Option<&str>) -> Result<(),
     Ok(())
 }
 
+#[derive(Debug)]
+struct GithubRunStep {
+    index: usize,
+    name: String,
+    script: String,
+}
+
+#[derive(Debug)]
+struct GithubJob {
+    image: String,
+    steps: Vec<GithubRunStep>,
+}
+
+fn github_job(path: &Path, selected_job: &str) -> Result<GithubJob, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let workflow: serde_yaml::Value = serde_yaml::from_str(&contents)
+        .map_err(|error| format!("invalid GitHub Actions YAML: {error}"))?;
+    let root = workflow
+        .as_mapping()
+        .ok_or("workflow root must be a YAML mapping")?;
+    let jobs = yaml_field(root, "jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or("workflow has no jobs mapping")?;
+    let job = jobs
+        .iter()
+        .find_map(|(key, value)| {
+            (yaml_string(key).as_deref() == Some(selected_job)).then_some(value)
+        })
+        .ok_or_else(|| format!("job `{selected_job}` was not found"))?
+        .as_mapping()
+        .ok_or("job must be a mapping")?;
+    let image = yaml_field(job, "container").and_then(|value| yaml_string(value).or_else(|| value.as_mapping().and_then(|map| yaml_field(map, "image")).and_then(yaml_string))).ok_or("local replay currently requires a job-level `container` image; GitHub-hosted runner emulation is not available yet")?;
+    let steps = yaml_field(job, "steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .ok_or("job has no steps")?;
+    let mut run_steps = Vec::new();
+    for (index, value) in steps.iter().enumerate() {
+        let step = value.as_mapping().ok_or("step must be a mapping")?;
+        if let Some(script) = yaml_field(step, "run").and_then(yaml_string) {
+            let name = yaml_field(step, "name")
+                .and_then(yaml_string)
+                .unwrap_or_else(|| format!("step {}", index + 1));
+            run_steps.push(GithubRunStep {
+                index: index + 1,
+                name,
+                script,
+            });
+        }
+    }
+    Ok(GithubJob {
+        image,
+        steps: run_steps,
+    })
+}
+
+fn run_github_step(image: &str, script: &str) -> Result<i32, String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--init",
+            "--workdir",
+            "/github/workspace",
+            "--volume",
+        ])
+        .arg(format!("{}:/github/workspace", cwd.display()))
+        .arg(image)
+        .args(["/bin/sh", "-e", "-c", script])
+        .status()
+        .map(|status| status.code().unwrap_or(1))
+        .map_err(|error| format!("failed to start Docker: {error}"))
+}
+
+fn replay_github_job(
+    path: &Path,
+    job_id: &str,
+    selected_step: Option<usize>,
+) -> Result<i32, String> {
+    if !docker_available() {
+        return Err("docker is not on PATH".into());
+    }
+    let job = github_job(path, job_id)?;
+    let steps: Vec<_> = job
+        .steps
+        .iter()
+        .filter(|step| selected_step.is_none_or(|index| step.index == index))
+        .collect();
+    if steps.is_empty() {
+        return Err(format!(
+            "run step {} was not found",
+            selected_step
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "in this job".into())
+        ));
+    }
+    println!(
+        "Apux GitHub Actions replay\n  job: {job_id}\n  image: {}\n  workspace: /github/workspace\n",
+        job.image
+    );
+    for step in steps {
+        println!("→ {}. {}", step.index, step.name);
+        let code = run_github_step(&job.image, &step.script)?;
+        if code != 0 {
+            println!("✗ step {} failed with exit code {code}", step.index);
+            return Ok(code);
+        }
+    }
+    println!("✓ selected GitHub Actions run steps passed.");
+    Ok(0)
+}
+
 fn print_docker_findings(command: &[OsString], image: Option<&str>) -> bool {
     println!(
         "Apux preflight: docker\n  command: {}\n  image:   {}\n  workdir: /workspace (current directory mounted)\n",
@@ -1169,6 +1340,18 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "gha-run" | "gha-step" => match replay_github_job(
+            invocation.workflow.as_deref().expect("gha needs workflow"),
+            invocation.job.as_deref().expect("gha needs job"),
+            invocation.step,
+        ) {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(code) => ExitCode::from(code as u8),
+            Err(error) => {
+                eprintln!("error: GitHub Actions replay failed: {error}");
+                ExitCode::from(1)
+            }
+        },
         _ => unreachable!(),
     }
 }
@@ -1219,5 +1402,16 @@ mod tests {
             image: None,
         };
         assert_eq!(run_contract_cron(&contract).unwrap(), 0);
+    }
+
+    #[test]
+    fn extracts_only_runnable_steps_from_a_container_job() {
+        let path = std::env::temp_dir().join(format!("apux-replay-{}", std::process::id()));
+        fs::write(&path, "jobs:\n  test:\n    container: alpine:3.20\n    steps:\n      - uses: actions/checkout@v4\n      - name: Test\n        run: echo pass\n").unwrap();
+        let job = github_job(&path, "test").unwrap();
+        assert_eq!(job.image, "alpine:3.20");
+        assert_eq!(job.steps.len(), 1);
+        assert_eq!(job.steps[0].index, 2);
+        fs::remove_file(path).unwrap();
     }
 }

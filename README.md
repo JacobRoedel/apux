@@ -46,6 +46,10 @@ apux run --target docker --image node:22 -- npm test
 
 # See a job's container, declared environment names, and run steps before push.
 apux inspect github-actions --file .github/workflows/ci.yml --job test
+
+# Replay all `run:` steps, or only a selected workflow step, in its job container.
+apux gha run --workflow .github/workflows/ci.yml --job test
+apux gha step --workflow .github/workflows/ci.yml --job test --at 4
 ```
 
 `check` is intentionally conservative: warnings are hypotheses to inspect, not
@@ -71,6 +75,11 @@ never written to the contract or diagnostic output.
 - launchd plist, direct-execution, and explicit logging requirements
 - Docker image, container filesystem, working-directory, and environment drift
 - GitHub Actions job container, declared environment names, and runnable steps
+
+GitHub Actions replay currently supports jobs with an explicit `container:`. It
+mounts the checkout at `/github/workspace`, runs each `run:` step with
+`/bin/sh -e -c`, and intentionally skips `uses:` actions; this makes the local
+boundary explicit rather than pretending to emulate GitHub-hosted runners.
 
 Apux never prints environment-variable values in `diff`, and it does not read
 or store secrets.
