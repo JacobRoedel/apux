@@ -26,11 +26,16 @@ apux run --target cron -- ./scripts/nightly-sync.sh
 
 # Generate an explicit wrapper and starter contract (does not install a crontab).
 apux init --target cron -- ./scripts/nightly-sync.sh
+
+# Verify the declared command, working directory, shell, paths, and required
+# environment *names* in apux.yaml.
+apux verify --target cron
 ```
 
 `check` is intentionally conservative: warnings are hypotheses to inspect, not
 claims that every job will fail. `run` is the proof step; it starts the command
 with an empty environment and adds only cron's normal shell, PATH, and HOME.
+`verify` makes that context review repeatable in CI or pre-commit hooks.
 
 ## What it checks today
 
@@ -50,6 +55,9 @@ or store secrets.
 `apux init` writes `apux.yaml` and `.apux/run.sh`. The wrapper makes the working
 directory, shell, PATH, and logging destination explicit. Review it, change the
 project-specific values, then add the printed line to your crontab yourself.
+
+The contract intentionally records only required environment-variable names in
+`required_env`; never put secret values in `apux.yaml`.
 
 ## Development
 
