@@ -1,0 +1,10 @@
+[package]
+name = "apux"
+version = "0.1.0"
+edition = "2024"
+description = "Preflight unattended commands before they fail in production."
+license = "MIT"
+repository = "https://github.com/JacobRoedel/apux"
+
+[dependencies]
+
