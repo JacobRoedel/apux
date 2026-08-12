@@ -62,6 +62,8 @@ struct Invocation {
     command: Vec<OsString>,
     contract: PathBuf,
     image: Option<String>,
+    workflow: Option<PathBuf>,
+    job: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,7 +86,7 @@ struct ExecutionContract {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target docker --image node:22 -- npm test\n  apux run --target docker --image node:22 -- npm test\n  apux verify --target cron"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux check --target cron -- ./scripts/nightly-sync.sh\n  apux check --target docker --image node:22 -- npm test\n  apux inspect github-actions --file .github/workflows/ci.yml --job test\n  apux verify --target cron"
     );
 }
 
@@ -100,9 +102,44 @@ fn parse_args() -> Result<Invocation, String> {
     let action = action.to_string_lossy().to_string();
     if !matches!(
         action.as_str(),
-        "check" | "diff" | "run" | "init" | "verify"
+        "check" | "diff" | "run" | "init" | "verify" | "inspect"
     ) {
         return Err(format!("unknown command: {action}"));
+    }
+    if action == "inspect" {
+        let integration = args
+            .next()
+            .ok_or("expected integration name after inspect")?
+            .to_string_lossy()
+            .to_string();
+        if integration != "github-actions" {
+            return Err(format!(
+                "unsupported integration: {integration}. Supported: github-actions."
+            ));
+        }
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--file")) {
+            return Err("expected --file <workflow.yml>".into());
+        }
+        let workflow = PathBuf::from(args.next().ok_or("missing workflow path after --file")?);
+        let job = match args.next() {
+            None => None,
+            Some(flag) if flag == "--job" => Some(
+                args.next()
+                    .ok_or("missing job id after --job")?
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            Some(_) => return Err("inspect accepts only optional --job <job-id>".into()),
+        };
+        return Ok(Invocation {
+            action,
+            target: "github-actions".into(),
+            command: vec![],
+            contract: PathBuf::from("apux.yaml"),
+            image: None,
+            workflow: Some(workflow),
+            job,
+        });
     }
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--target")) {
         return Err("expected --target cron".into());
@@ -132,6 +169,8 @@ fn parse_args() -> Result<Invocation, String> {
             command: vec![],
             contract,
             image: None,
+            workflow: None,
+            job: None,
         });
     }
     let mut next = args.next();
@@ -159,6 +198,8 @@ fn parse_args() -> Result<Invocation, String> {
         command,
         contract: PathBuf::from("apux.yaml"),
         image,
+        workflow: None,
+        job: None,
     })
 }
 
@@ -551,6 +592,106 @@ fn docker_available() -> bool {
     find_on_path("docker").is_some()
 }
 
+fn yaml_field<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.into()))
+}
+
+fn yaml_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn inspect_github_actions(path: &Path, selected_job: Option<&str>) -> Result<(), String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let workflow: serde_yaml::Value = serde_yaml::from_str(&contents)
+        .map_err(|error| format!("invalid GitHub Actions YAML: {error}"))?;
+    let root = workflow
+        .as_mapping()
+        .ok_or("workflow root must be a YAML mapping")?;
+    let jobs = yaml_field(root, "jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or("workflow has no jobs mapping")?;
+    let jobs_to_show: Vec<_> = jobs
+        .iter()
+        .filter(|(key, _)| selected_job.is_none_or(|job| yaml_string(key).as_deref() == Some(job)))
+        .collect();
+    if jobs_to_show.is_empty() {
+        return Err(format!(
+            "job `{}` was not found",
+            selected_job.unwrap_or_default()
+        ));
+    }
+    println!(
+        "Apux GitHub Actions inspection\n  workflow: {}\n",
+        path.display()
+    );
+    for (job_id, value) in jobs_to_show {
+        let job = value.as_mapping().ok_or("job must be a mapping")?;
+        let job_name = yaml_string(job_id).unwrap_or_else(|| "<unnamed>".into());
+        let container = yaml_field(job, "container")
+            .and_then(|value| {
+                yaml_string(value).or_else(|| {
+                    value
+                        .as_mapping()
+                        .and_then(|map| yaml_field(map, "image"))
+                        .and_then(yaml_string)
+                })
+            })
+            .unwrap_or_else(|| "GitHub-hosted runner (no job container declared)".into());
+        let mut env_names = BTreeSet::new();
+        for source in [yaml_field(root, "env"), yaml_field(job, "env")] {
+            if let Some(environment) = source.and_then(serde_yaml::Value::as_mapping) {
+                for key in environment.keys() {
+                    if let Some(name) = yaml_string(key) {
+                        env_names.insert(name);
+                    }
+                }
+            }
+        }
+        println!(
+            "job: {job_name}\n  container: {container}\n  environment names: {}",
+            if env_names.is_empty() {
+                "<none declared>".into()
+            } else {
+                env_names.into_iter().collect::<Vec<_>>().join(", ")
+            }
+        );
+        let steps = yaml_field(job, "steps")
+            .and_then(serde_yaml::Value::as_sequence)
+            .cloned()
+            .unwrap_or_default();
+        if steps.is_empty() {
+            println!("  steps: <none>");
+        } else {
+            println!("  steps:");
+            for (index, step) in steps.iter().enumerate() {
+                let step = step.as_mapping().ok_or("step must be a mapping")?;
+                let name = yaml_field(step, "name")
+                    .and_then(yaml_string)
+                    .unwrap_or_else(|| format!("step {}", index + 1));
+                if let Some(run) = yaml_field(step, "run").and_then(yaml_string) {
+                    println!(
+                        "    {}. {name} [run: {} line(s)]",
+                        index + 1,
+                        run.lines().count()
+                    );
+                } else if let Some(uses) = yaml_field(step, "uses").and_then(yaml_string) {
+                    println!("    {}. {name} [uses: {uses}]", index + 1);
+                } else {
+                    println!("    {}. {name}", index + 1);
+                }
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
 fn print_docker_findings(command: &[OsString], image: Option<&str>) -> bool {
     println!(
         "Apux preflight: docker\n  command: {}\n  image:   {}\n  workdir: /workspace (current directory mounted)\n",
@@ -849,6 +990,19 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        "inspect" => match inspect_github_actions(
+            invocation
+                .workflow
+                .as_deref()
+                .expect("inspect needs workflow"),
+            invocation.job.as_deref(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
         _ => unreachable!(),
     }
 }
@@ -875,5 +1029,13 @@ mod tests {
         let contract: ExecutionContract = serde_yaml::from_str(value).unwrap();
         assert_eq!(contract.command, ["/bin/echo", "hello"]);
         assert_eq!(contract.required_env, ["API_TOKEN"]);
+    }
+
+    #[test]
+    fn reads_github_actions_job_container_and_steps() {
+        let root = std::env::temp_dir().join(format!("apux-workflow-{}", std::process::id()));
+        fs::write(&root, "env:\n  TOKEN: ${{ secrets.TOKEN }}\njobs:\n  test:\n    container: node:22\n    env:\n      NODE_ENV: test\n    steps:\n      - uses: actions/checkout@v4\n      - name: Test\n        run: npm test\n").unwrap();
+        assert!(inspect_github_actions(&root, Some("test")).is_ok());
+        fs::remove_file(root).unwrap();
     }
 }

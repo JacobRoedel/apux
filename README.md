@@ -4,7 +4,7 @@ Apux is a preflight tool for unattended commands. It exposes the hidden executio
 context that makes a command work in a developer terminal but fail under cron.
 
 > Apux currently supports cron, systemd, launchd, and Docker preflight checks.
-> CI adapters are planned.
+> GitHub Actions workflow inspection is available; interactive CI replay is next.
 
 ## Install from source
 
@@ -40,6 +40,9 @@ apux check --target launchd -- /usr/local/bin/nightly-sync
 # Docker mounts your current checkout at /workspace in the specified image.
 apux check --target docker --image node:22 -- npm test
 apux run --target docker --image node:22 -- npm test
+
+# See a job's container, declared environment names, and run steps before push.
+apux inspect github-actions --file .github/workflows/ci.yml --job test
 ```
 
 `check` is intentionally conservative: warnings are hypotheses to inspect, not
@@ -59,6 +62,7 @@ with an empty environment and adds only cron's normal shell, PATH, and HOME.
 - systemd `ExecStart` requirements, direct-execution behavior, and journal logs
 - launchd plist, direct-execution, and explicit logging requirements
 - Docker image, container filesystem, working-directory, and environment drift
+- GitHub Actions job container, declared environment names, and runnable steps
 
 Apux never prints environment-variable values in `diff`, and it does not read
 or store secrets.
