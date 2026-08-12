@@ -88,7 +88,7 @@ struct ExecutionContract {
 
 fn usage() {
     println!(
-        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux run --contract apux.yaml\n  apux check --target docker --image node:22 -- npm test\n  apux inspect github-actions --file .github/workflows/ci.yml --job test"
+        "apux — preflight unattended commands\n\nUSAGE:\n  apux <check|diff|run|debug|init> --target <cron|systemd|launchd> -- <command> [args...]\n  apux <check|diff|run|debug> --target docker --image <image> -- <command> [args...]\n  apux run --contract [apux.yaml]\n  apux verify --target <cron|systemd|launchd|docker> [--contract apux.yaml]\n  apux inspect github-actions --file <workflow.yml> [--job <job-id>]\n\nEXAMPLES:\n  apux debug --target cron -- ./scripts/nightly-sync.sh\n  apux debug --target docker --image node:22 -- npm test"
     );
 }
 
@@ -157,7 +157,7 @@ fn parse_args() -> Result<Invocation, String> {
     }
     if !matches!(
         action.as_str(),
-        "check" | "diff" | "run" | "init" | "verify" | "inspect"
+        "check" | "diff" | "run" | "debug" | "init" | "verify" | "inspect"
     ) {
         return Err(format!("unknown command: {action}"));
     }
@@ -947,6 +947,49 @@ fn run_docker(command: &[OsString], image: &str) -> io::Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn debug_cron() -> io::Result<i32> {
+    println!(
+        "Apux debug shell: cron\n  PATH: {CRON_PATH}\n  shell: {CRON_SHELL}\n  Type `exit` to return to Apux.\n"
+    );
+    let status = Command::new(CRON_SHELL)
+        .env_clear()
+        .env("PATH", CRON_PATH)
+        .env("SHELL", CRON_SHELL)
+        .env(
+            "HOME",
+            env::var_os("HOME").unwrap_or_else(|| OsString::from("/")),
+        )
+        .env(
+            "LOGNAME",
+            env::var("USER").unwrap_or_else(|_| "unknown".into()),
+        )
+        .current_dir(env::current_dir()?)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn debug_docker(image: &str) -> io::Result<i32> {
+    let cwd = env::current_dir()?;
+    println!(
+        "Apux debug shell: docker\n  image: {image}\n  workspace: /workspace\n  Type `exit` to return to Apux.\n"
+    );
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--init",
+            "-it",
+            "--workdir",
+            "/workspace",
+            "--volume",
+        ])
+        .arg(format!("{}:/workspace", cwd.display()))
+        .arg(image)
+        .args(["/bin/sh"])
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn required_environment(contract: &ExecutionContract) -> Result<Vec<(String, OsString)>, String> {
     contract.required_env.iter().map(|name| {
         env::var_os(name).map(|value| (name.clone(), value)).ok_or_else(|| format!("required environment variable `{name}` is not set in the invoking environment"))
@@ -1306,6 +1349,35 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "debug" if invocation.target == "docker" => match invocation.image.as_deref() {
+            Some(image) => match debug_docker(image) {
+                Ok(0) => ExitCode::SUCCESS,
+                Ok(code) => ExitCode::from(code as u8),
+                Err(error) => {
+                    eprintln!("error: failed to open Docker debug shell: {error}");
+                    ExitCode::from(1)
+                }
+            },
+            None => {
+                eprintln!("error: Docker target requires --image <image>");
+                ExitCode::from(2)
+            }
+        },
+        "debug" if invocation.target == "cron" => match debug_cron() {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(code) => ExitCode::from(code as u8),
+            Err(error) => {
+                eprintln!("error: failed to open cron debug shell: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "debug" => {
+            eprintln!(
+                "error: interactive debug is currently available for cron and docker; use verify for {}",
+                invocation.target
+            );
+            ExitCode::from(2)
+        }
         "init" if invocation.target == "cron" => match init(&invocation.command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

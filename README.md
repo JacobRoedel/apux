@@ -34,6 +34,9 @@ apux verify --target cron
 # Execute the declared command in its declared target context.
 apux run --contract apux.yaml
 
+# Open a real shell with cron's isolated environment.
+apux debug --target cron -- ./scripts/nightly-sync.sh
+
 # systemd has different rules: no implicit shell and an absolute ExecStart path.
 apux check --target systemd -- /usr/local/bin/nightly-sync
 
@@ -43,6 +46,7 @@ apux check --target launchd -- /usr/local/bin/nightly-sync
 # Docker mounts your current checkout at /workspace in the specified image.
 apux check --target docker --image node:22 -- npm test
 apux run --target docker --image node:22 -- npm test
+apux debug --target docker --image node:22 -- npm test
 
 # See a job's container, declared environment names, and run steps before push.
 apux inspect github-actions --file .github/workflows/ci.yml --job test
@@ -61,6 +65,9 @@ with an empty environment and adds only cron's normal shell, PATH, and HOME.
 contracts with only their declared PATH and required environment names, and
 Docker contracts in their declared image. Values are read only at runtime and
 never written to the contract or diagnostic output.
+
+`debug` opens a shell in the cron or Docker context. It does not modify a
+scheduler, install a service, or inject undeclared secrets.
 
 ## What it checks today
 
