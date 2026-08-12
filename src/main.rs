@@ -1663,6 +1663,88 @@ fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn valid_environment_name(name: &str) -> bool {
+    name.bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn standalone_secret_exports(requirements: &[RequiredEnvironment]) -> io::Result<String> {
+    let mut lines = Vec::new();
+    for requirement in requirements {
+        let name = requirement.name();
+        if !valid_environment_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid environment name `{name}`"),
+            ));
+        }
+        match requirement.source() {
+            None => lines.push(format!(": \"${{{name}:?missing {name}}}\"")),
+            Some(source) if source.starts_with("env://") => {
+                let source_name = source.trim_start_matches("env://");
+                if !valid_environment_name(source_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid env source `{source}`"),
+                    ));
+                }
+                lines.push(format!(
+                    "export {name}=\"${{{source_name}:?missing {source_name}}}\""
+                ));
+            }
+            Some(source) if source.starts_with("op://") => lines.push(format!(
+                "export {name}=\"$(op read {})\"",
+                shell_quote(source)
+            )),
+            Some(source) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported secret source `{source}`"),
+                ));
+            }
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn standalone_wrapper(contract: &ExecutionContract) -> io::Result<String> {
+    let command: Vec<OsString> = contract.command.iter().map(OsString::from).collect();
+    let log = contract.log.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "standalone artifact requires a log path",
+        )
+    })?;
+    let path = contract.path.as_deref().unwrap_or(CRON_PATH);
+    let secrets = standalone_secret_exports(&contract.required_env)?;
+    let invocation = if let Some(shell) = &contract.shell {
+        let parts = shell_parts(shell).map_err(io::Error::other)?;
+        format!(
+            "{} -c {}",
+            parts
+                .iter()
+                .map(|part| shell_quote(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+            shell_quote(&command_display(&command))
+        )
+    } else {
+        command_display(&command)
+    };
+    Ok(format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\n\ncd {}\nexport PATH={}\n{}\n\nexec {} >> {} 2>&1\n",
+        shell_quote(&contract.working_directory.display().to_string()),
+        shell_quote(path),
+        secrets,
+        invocation,
+        shell_quote(&log.display().to_string())
+    ))
+}
+
 fn init(target: &str, command: &[OsString], image: Option<&str>) -> io::Result<()> {
     let root = env::current_dir()?;
     let apux_dir = root.join(".apux");
@@ -1687,56 +1769,55 @@ fn init(target: &str, command: &[OsString], image: Option<&str>) -> io::Result<(
         serde_yaml::to_string(&contract).map_err(io::Error::other)?,
     )?;
     match target {
-        "cron" => {
+        "cron" | "systemd" | "launchd" => {
             let wrapper_path = apux_dir.join("run.sh");
-            fs::write(
-                &wrapper_path,
-                format!(
-                    "#!/usr/bin/env bash\nset -euo pipefail\n\nexec apux run --contract {}\n",
-                    shell_quote(&root.join("apux.yaml").display().to_string())
-                ),
-            )?;
+            fs::write(&wrapper_path, standalone_wrapper(&contract)?)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
             }
-            println!(
-                "Created .apux/run.sh and apux.yaml.\n\nReview them, then add a schedule like:\n  0 2 * * * {}\n",
-                wrapper_path.display()
-            );
-        }
-        "systemd" => {
-            let path = apux_dir.join("apux.service");
-            fs::write(
-                &path,
-                format!(
-                    "[Unit]\nDescription=Apux managed job\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nExecStart=apux run --contract {}\n",
-                    root.display(),
-                    root.join("apux.yaml").display()
+            match target {
+                "cron" => println!(
+                    "Created standalone .apux/run.sh plus apux.yaml for optional testing.\n\nCron only needs the wrapper:\n  0 2 * * * {}\n",
+                    wrapper_path.display()
                 ),
-            )?;
-            println!(
-                "Created {} and apux.yaml.\n\nReview it, then copy it to ~/.config/systemd/user/ or /etc/systemd/system/ and enable it yourself.",
-                path.display()
-            );
-        }
-        "launchd" => {
-            let path = apux_dir.join("com.apux.job.plist");
-            fs::write(
-                &path,
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.apux.job</string>\n  <key>ProgramArguments</key><array><string>apux</string><string>run</string><string>--contract</string><string>{}</string></array>\n  <key>WorkingDirectory</key><string>{}</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
-                    xml_escape(&root.join("apux.yaml").display().to_string()),
-                    xml_escape(&root.display().to_string()),
-                    xml_escape(&log_path.display().to_string()),
-                    xml_escape(&log_path.display().to_string())
-                ),
-            )?;
-            println!(
-                "Created {} and apux.yaml.\n\nReview it, then load it with launchctl yourself.",
-                path.display()
-            );
+                "systemd" => {
+                    let path = apux_dir.join("apux.service");
+                    fs::write(
+                        &path,
+                        format!(
+                            "[Unit]\nDescription=Apux exported job\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nExecStart={}\n",
+                            root.display(),
+                            wrapper_path.display()
+                        ),
+                    )?;
+                    println!(
+                        "Created standalone {} and {}. Apux is not required at runtime.\n\nReview and install the unit yourself.",
+                        wrapper_path.display(),
+                        path.display()
+                    );
+                }
+                "launchd" => {
+                    let path = apux_dir.join("com.apux.job.plist");
+                    fs::write(
+                        &path,
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.apux.job</string>\n  <key>ProgramArguments</key><array><string>{}</string></array>\n  <key>WorkingDirectory</key><string>{}</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+                            xml_escape(&wrapper_path.display().to_string()),
+                            xml_escape(&root.display().to_string()),
+                            xml_escape(&log_path.display().to_string()),
+                            xml_escape(&log_path.display().to_string())
+                        ),
+                    )?;
+                    println!(
+                        "Created standalone {} and {}. Apux is not required at runtime.\n\nReview and load the plist yourself.",
+                        wrapper_path.display(),
+                        path.display()
+                    );
+                }
+                _ => unreachable!(),
+            }
         }
         "docker" => {
             let image = image.ok_or_else(|| {
